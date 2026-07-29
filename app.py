@@ -35,7 +35,7 @@ _active_browsers_lock = threading.Lock()
 
 # Pages per browser (shared browser mode)
 # Each Chromium process handles this many Zefoy sessions
-PAGES_PER_BROWSER = int(os.environ.get("PAGES_PER_BROWSER", "10"))
+PAGES_PER_BROWSER = int(os.environ.get("PAGES_PER_BROWSER", "3"))
 
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
