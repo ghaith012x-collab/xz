@@ -213,6 +213,35 @@ GENERATE_CF_OB_TE_JS = """(() => {
     window.generateCfObTeCookie = generateCfObTeCookie;
 })();"""
 
+
+async def inject_anti_detection_async(page):
+    """Async version for async Playwright."""
+    try:
+        for script in [DISMISS_ALERTS_JS, BLOCK_FC_POPUPS_JS, MOUSE_SIMULATION_K9X_JS, GENERATE_CF_OB_TE_JS]:
+            await page.evaluate(script)
+    except:
+        pass
+
+async def remove_overlays_async(page):
+    """Async version - strip ad iframes and consent dialogs."""
+    try:
+        await page.evaluate("""() => {
+            document.querySelectorAll('iframe').forEach(el => el.remove());
+            document.querySelectorAll('.fc-dialog-overlay, .fc-monetization-dialog-container, .fc-message-root, .fc-consent-root').forEach(el => el.remove());
+            document.querySelectorAll('.adsbygoogle, .ad-container, iframe[src*="googleads"], iframe[src*="ads"], iframe.adsbygoogle').forEach(el => el.remove());
+            document.querySelectorAll('[style*="position: fixed"], [style*="position: absolute"]').forEach(el => {
+                if (el.style.zIndex && parseInt(el.style.zIndex) > 9000) {
+                    if (el.querySelector('#captcha-img, input[name*="captcha"]') ||
+                        el.closest('.wrapper-capth, .captcha-container, form')) return;
+                    el.remove();
+                }
+            });
+            document.querySelectorAll('button').forEach(btn => {
+                if (btn.textContent.includes('Consent') && btn.offsetParent !== null) btn.click();
+            });
+        }""")
+    except:
+        pass
 def inject_anti_detection(page):
     try:
         for script in [DISMISS_ALERTS_JS, BLOCK_FC_POPUPS_JS, MOUSE_SIMULATION_K9X_JS, GENERATE_CF_OB_TE_JS]:
@@ -890,7 +919,7 @@ def run_tab(session, tab_id):
                         continue
 
                     z_sleep(5)
-                    inject_anti_detection(page)
+                    await inject_anti_detection_async(page)
                     if not safe_check(page):
                         session.log(" Page crashed on load, restarting...")
                         continue
@@ -1038,7 +1067,7 @@ def run_tab(session, tab_id):
                                         try:
                                             page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=8000)
                                             session.log(" Captcha solved!")
-                                            inject_anti_detection(page)
+                                            await inject_anti_detection_async(page)
                                             captcha_solved = True
                                             break
                                         except:
@@ -1104,7 +1133,7 @@ def run_tab(session, tab_id):
                         continue
 
                     z_sleep(2)
-                    inject_anti_detection(page)
+                    await inject_anti_detection_async(page)
                     session.log(f" {svc_name} panel opened!")
                     backoff = 5
                     url_filled = False
@@ -1607,16 +1636,16 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                     continue
 
                 await z_sleep(5)
-                inject_anti_detection(page)
+                await inject_anti_detection_async(page)
 
                 # Check page is alive
-                def safe_check():
+                async def safe_check():
                     try:
-                        page.title()
+                        await page.title()
                         return True
                     except:
                         return False
-                if not safe_check():
+                if not await safe_check():
                     continue
 
                 # ---- Captcha handling ----
@@ -1626,10 +1655,10 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                 for pa in range(10):
                     if session.stop_event.is_set():
                         return
-                    if not safe_check():
+                    if not await safe_check():
                         break
                     try:
-                        t = page.title().lower()
+                        t = (await page.title()).lower()
                         b = (await page.inner_text("body"))[:200].lower()
                         if "502" in t or "502 bad gateway" in b:
                             await z_sleep(10 + pa * 3)
@@ -1676,7 +1705,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                         for ca in range(20):
                             if session.stop_event.is_set():
                                 return
-                            if not safe_check():
+                            if not await safe_check():
                                 break
                             try:
                                 ci = page.locator("#captcha-img, img[src*='CAPTCHA'], img[src*='captcha']")
@@ -1697,7 +1726,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                                     await z_sleep(3)
                                     continue
                                 session.log(f" Answer: '{answer}'")
-                                remove_overlays(page)
+                                await remove_overlays_async(page)
                                 await z_sleep(0.5)
                                 inp = page.locator("input[name='captchalogin'], input.captcha-login-input, input[placeholder='Enter the word']")
                                 try:
@@ -1727,14 +1756,14 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                                         await z_sleep(3)
                                         continue
                                 await z_sleep(0.5)
-                                remove_overlays(page)
+                                await remove_overlays_async(page)
                                 await z_sleep(0.3)
                                 await page.locator("button.submit-captcha").first.click()
                                 await z_sleep(5)
                                 try:
                                     await page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=8000)
                                     session.log(" Captcha solved!")
-                                    inject_anti_detection(page)
+                                    await inject_anti_detection_async(page)
                                     captcha_solved = True
                                     break
                                 except:
@@ -1769,12 +1798,12 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                     be = page.locator(f".{btn_cls}").first
                     await be.scroll_into_view_if_needed()
                     await z_sleep(0.5)
-                    remove_overlays(page)
+                    await remove_overlays_async(page)
                     await z_sleep(0.3)
                     try:
                         await be.click(timeout=5000)
                     except:
-                        remove_overlays(page)
+                        await remove_overlays_async(page)
                         await z_sleep(0.3)
                         await be.click(force=True, timeout=10000)
                 except Exception as e:
@@ -1782,7 +1811,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                         session.log(f" Click: {e}")
                     continue
                 await z_sleep(2)
-                inject_anti_detection(page)
+                await inject_anti_detection_async(page)
                 session.log(f" {svc_name} panel opened!")
 
                 url_filled = False
@@ -1790,7 +1819,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
 
                 # ---- Main Zefoy loop ----
                 while not session.stop_event.is_set():
-                    if not safe_check():
+                    if not await safe_check():
                         session.log(" Page crashed, restarting...")
                         break
                     cycle = session.add_cycle()
@@ -1801,7 +1830,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                             input_fail_count = 0
                         except:
                             try:
-                                remove_overlays(page)
+                                await remove_overlays_async(page)
                                 await z_sleep(0.3)
                                 await page.locator(f".{btn_cls}").first.click(force=True)
                                 await z_sleep(2)
@@ -1828,7 +1857,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                             await url_input.fill(session.video_url)
                             await z_sleep(1)
                             url_filled = True
-                        remove_overlays(page)
+                        await remove_overlays_async(page)
                         await z_sleep(0.3)
                         await page.locator(submit_panel_sel).first.click()
                         await z_sleep(3)
@@ -1846,7 +1875,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                         except:
                             break
                         if "too many" in body_check or "slow down" in body_check:
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             await page.locator(submit_panel_sel).first.click()
                             await z_sleep(3)
@@ -1863,7 +1892,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                                 session.set_countdown(f" {m}m {s:02d}s" if m else f" {s}s")
                                 await z_sleep(1)
                             session.set_countdown("")
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             await page.locator(submit_panel_sel).first.click()
                             await z_sleep(3)
@@ -1872,13 +1901,13 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                             try:
                                 cb = page.locator(f"{HEARTS_BTN_SEL}:visible, button.wbutton:visible").first
                                 await cb.wait_for(state="visible", timeout=20000)
-                                remove_overlays(page)
+                                await remove_overlays_async(page)
                                 await z_sleep(0.3)
                                 await cb.click()
                                 await z_sleep(4)
                                 session.log(" Comments loaded")
                             except:
-                                remove_overlays(page)
+                                await remove_overlays_async(page)
                                 await z_sleep(0.3)
                                 await page.locator(submit_panel_sel).first.click()
                                 await z_sleep(3)
@@ -1905,7 +1934,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                                     form_loc = page.locator("form.w1a").nth(result['index'])
                                     await form_loc.locator("select[name='select_lmt']").select_option("100")
                                     await z_sleep(0.5)
-                                    remove_overlays(page)
+                                    await remove_overlays_async(page)
                                     await z_sleep(0.3)
                                     await form_loc.locator("button[type='submit']").click()
                                     session.log(f" Sent 100 hearts to @{target_user}")
@@ -1931,7 +1960,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                                 break
                         if not found_user:
                             await z_sleep(2)
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             await page.locator(submit_panel_sel).first.click()
                             await z_sleep(3)
@@ -1946,7 +1975,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                         elif "too many" in body or "slow down" in body:
                             session.log(" Too many requests")
                         await z_sleep(2)
-                        remove_overlays(page)
+                        await remove_overlays_async(page)
                         await z_sleep(0.3)
                         await page.locator(submit_panel_sel).first.click()
                         await z_sleep(3)
@@ -1966,7 +1995,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                         lb = body.lower()
                         if "too many" in lb or "slow down" in lb:
                             await z_sleep(2)
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             await page.locator(submit_panel_sel).first.click()
                             await z_sleep(3)
@@ -1982,7 +2011,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                                 session.set_countdown(f" {m}m {s:02d}s" if m else f" {s}s")
                                 await z_sleep(1)
                             session.set_countdown("")
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             await page.locator(submit_panel_sel).first.click()
                             await z_sleep(1)
@@ -1990,7 +2019,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                             await z_sleep(3)
                             continue
                         if "ready" in lb and "next submit" in lb:
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             await page.locator(submit_panel_sel).first.click()
                             await z_sleep(3)
@@ -2008,7 +2037,7 @@ async def _run_page_async(session, page, tab_id, browser_idx):
                             break
                         send_clicked = False
                         try:
-                            remove_overlays(page)
+                            await remove_overlays_async(page)
                             await z_sleep(0.3)
                             sels = []
                             if panel_sel:
