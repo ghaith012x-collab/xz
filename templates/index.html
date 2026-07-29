@@ -256,7 +256,7 @@ body::before {
     <div class="stats" id="globalStats">
         <span class="pill">Active <b id="statActive">0</b></span>
         <span class="pill">Sessions <b id="statTotal">0</b></span>
-        <span class="pill">🌐 Browsers <b id="statBrowsers">0/20</b></span>
+        <span class="pill">🌐 Browsers <b id="statBrowsers">0/50</b></span>
     </div>
 </div>
 
@@ -364,7 +364,7 @@ function createCard(s) {
         <div class="card-metrics">
             <div class="metric count-metric"><div class="val" id="count-${s.id}">0</div><div class="lbl">${s.serviceName}</div></div>
             <div class="metric"><div class="val" id="cycles-${s.id}">0</div><div class="lbl">Cycles</div></div>
-            ${nTabs > 1 ? `<div class="metric"><div class="val"><span id="activetabs-${s.id}">${nTabs}</span>/${nTabs}</div><div class="lbl">Browsers</div></div>` : ''}
+            ${nTabs > 1 ? `<div class="metric"><div class="val"><span id="activetabs-${s.id}">${nTabs}</span>/${nTabs}</div><div class="lbl">Pages</div></div>` : ''}
         </div>
         <div class="card-url">🔗 <span class="u">${s.url}</span>${s.username ? '<br>👤 @' + s.username : ''}</div>
         ${tabsInfo}
@@ -478,7 +478,7 @@ evtSource.onmessage = function(e) {
     updateGlobalStats();
 };
 
-let _globalBrowsers = 0, _maxBrowsers = 20;
+let _globalBrowsers = 0, _maxBrowsers = 50;
 function updateGlobalStats() {
     let active = 0, total = 0;
     for (const sid in cards) {
