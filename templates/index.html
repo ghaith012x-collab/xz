@@ -256,7 +256,7 @@ body::before {
     <div class="stats" id="globalStats">
         <span class="pill">Active <b id="statActive">0</b></span>
         <span class="pill">Sessions <b id="statTotal">0</b></span>
-        <span class="pill">🌐 Browsers <b id="statBrowsers">0/50</b></span>
+        <span class="pill">🌐 Browsers <b id="statBrowsers">0</b></span>
     </div>
 </div>
 
@@ -431,7 +431,6 @@ evtSource.onmessage = function(e) {
                 if (!cards[s.id]) createCard(s);
             });
             if (data.browsers !== undefined) _globalBrowsers = data.browsers;
-            if (data.maxBrowsers !== undefined) _maxBrowsers = data.maxBrowsers;
         });
         return;
     }
@@ -478,7 +477,7 @@ evtSource.onmessage = function(e) {
     updateGlobalStats();
 };
 
-let _globalBrowsers = 0, _maxBrowsers = 50;
+let _globalBrowsers = 0;
 function updateGlobalStats() {
     let active = 0, total = 0;
     for (const sid in cards) {
@@ -488,12 +487,11 @@ function updateGlobalStats() {
     }
     document.getElementById('statActive').textContent = active;
     document.getElementById('statTotal').textContent = total;
-    document.getElementById('statBrowsers').textContent = `${_globalBrowsers}/${_maxBrowsers}`;
+    document.getElementById('statBrowsers').textContent = _globalBrowsers;
 }
 setInterval(() => {
     fetch('/sessions').then(r => r.json()).then(data => {
         if (data.browsers !== undefined) _globalBrowsers = data.browsers;
-        if (data.maxBrowsers !== undefined) _maxBrowsers = data.maxBrowsers;
         updateGlobalStats();
     }).catch(() => {});
 }, 2000);
@@ -507,7 +505,6 @@ function escapeHtml(text) {
 fetch('/sessions').then(r => r.json()).then(data => {
     (data.sessions || data).forEach(s => createCard(s));
     if (data.browsers !== undefined) _globalBrowsers = data.browsers;
-    if (data.maxBrowsers !== undefined) _maxBrowsers = data.maxBrowsers;
     updateGlobalStats();
     updateEmptyState();
 });
