@@ -1596,7 +1596,7 @@ def run_tab(session, tab_id):
 # 
 #  SHARED BROWSER MODE — async Playwright (thread-safe, concurrent pages)
 # 
-async def _run_page_async(session, page, tab_id, browser_idx):
+async def _run_page_async(session, browser, tab_id, browser_idx):
     """Run one Zefoy session using a shared browser page (async)."""
     import gc as _gc
     svc = session.svc
@@ -1625,11 +1625,25 @@ async def _run_page_async(session, page, tab_id, browser_idx):
     with session.count_lock:
         session.active_tabs += 1
     try:
+        page = None
         for restart in range(50):
             if session.stop_event.is_set():
                 return
             if restart > 0:
                 await z_sleep(5)
+
+            # Create a FRESH page from the shared browser on each restart
+            try:
+                if page:
+                    try:
+                        await page.close()
+                    except:
+                        pass
+                page = await browser.new_page(viewport={"width": 800, "height": 600})
+                page.on("dialog", lambda d: d.accept())
+            except Exception as pe:
+                session.log(f" Page creation error: {pe}")
+                continue
 
             page_closed = False
             try:
@@ -2155,12 +2169,10 @@ async def _run_shared_browser_async(session, browser_idx):
 
             browser = await p.chromium.launch(slow_mo=100, **launch_opts)
             
-            # Create all pages upfront in this async context, then run concurrently
+            # Each _run_page_async creates its own pages from the shared browser
             tasks = []
             for tid in tab_ids:
-                page = await browser.new_page(viewport={"width": 800, "height": 600})
-                page.on("dialog", lambda d: d.accept())
-                tasks.append(asyncio.create_task(_run_page_async(session, page, tid, browser_idx)))
+                tasks.append(asyncio.create_task(_run_page_async(session, browser, tid, browser_idx)))
                 await asyncio.sleep(2)
             
             await asyncio.gather(*tasks)
