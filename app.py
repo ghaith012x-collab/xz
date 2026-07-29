@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, Response
 from playwright.sync_api import sync_playwright
-import threading, time, re, sys, difflib, json, base64, os, resource
+from playwright.async_api import async_playwright as async_pw
+import threading, time, re, sys, difflib, json, base64, os, resource, asyncio
 from PIL import Image, ImageOps
 from io import BytesIO
 from collections import Counter, deque
@@ -730,14 +731,13 @@ def run_session(session):
         num_browsers = max(1, _math.ceil(nt / PAGES_PER_BROWSER))
         actual_sessions = num_browsers * PAGES_PER_BROWSER
         session.log(f" Launching {num_browsers} browsers x {PAGES_PER_BROWSER} pages = {actual_sessions} sessions ({svc_name})...")
-        threads = []
+        import asyncio
         for bi in range(num_browsers):
-            t = threading.Thread(target=_run_shared_browser, args=(session, bi), daemon=True)
-            t.start()
-            threads.append(t)
+            try:
+                asyncio.run(_run_shared_browser_async(session, bi))
+            except Exception as e:
+                session.log(f" [B{bi+1}] Fatal: {e}")
             time.sleep(3)
-        for t in threads:
-            t.join()
     elif nt <= 1:
         session.log(f" Launching browser ({svc_name} mode)...")
         run_tab(session, 0)
@@ -1558,15 +1558,11 @@ def run_tab(session, tab_id):
 
 
 # 
-#  SHARED BROWSER MODE — multiple Zefoy sessions per Chromium process
+#  SHARED BROWSER MODE — async Playwright (thread-safe, concurrent pages)
 # 
-def _run_bot_page(session, tab_id, browser, browser_idx):
-    """Run one Zefoy session using a shared browser's page."""
+async def _run_page_async(session, page, tab_id, browser_idx):
+    """Run one Zefoy session using a shared browser page (async)."""
     import gc as _gc
-    import time as _time
-    if tab_id not in session.video_buffers:
-        session.video_buffers[tab_id] = FrameBuffer()
-
     svc = session.svc
     svc_name = svc["name"]
     btn_cls = svc["button_class"]
@@ -1579,16 +1575,16 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
     multi = session.num_tabs > 1
     _tab_prefix.value = f"[P{tab_id+1}] " if multi else ""
 
-    def z_sleep(seconds):
+    async def z_sleep(seconds):
         if session.stop_event.is_set():
             raise Exception("Session stopped")
         if seconds <= 0:
             return
-        end_t = _time.time() + seconds
-        while _time.time() < end_t:
+        end_t = time.time() + seconds
+        while time.time() < end_t:
             if session.stop_event.is_set():
                 raise Exception("Session stopped")
-            _time.sleep(min(0.5, end_t - _time.time()))
+            await asyncio.sleep(min(0.5, end_t - time.time()))
 
     with session.count_lock:
         session.active_tabs += 1
@@ -1597,30 +1593,30 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
             if session.stop_event.is_set():
                 return
             if restart > 0:
-                z_sleep(5)
+                await z_sleep(5)
 
-            page = None
+            page_closed = False
             try:
-                page = browser.new_page(viewport={"width": 800, "height": 600})
-                page.on("dialog", lambda d: d.accept())
+                # Navigate to zefoy
+                session.log(" Loading zefoy.com...")
+                try:
+                    await page.goto(ZEFOY, wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    session.log(f" Load error: {e}")
+                    page_closed = True
+                    continue
 
-                def safe_check(pg):
+                await z_sleep(5)
+                inject_anti_detection(page)
+
+                # Check page is alive
+                def safe_check():
                     try:
-                        pg.title()
+                        page.title()
                         return True
                     except:
                         return False
-
-                session.log(" Loading zefoy.com...")
-                try:
-                    page.goto(ZEFOY, wait_until="domcontentloaded", timeout=60000)
-                except Exception as e:
-                    session.log(f" Load error: {e}")
-                    continue
-
-                z_sleep(5)
-                inject_anti_detection(page)
-                if not safe_check(page):
+                if not safe_check():
                     continue
 
                 # ---- Captcha handling ----
@@ -1630,42 +1626,42 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                 for pa in range(10):
                     if session.stop_event.is_set():
                         return
-                    if not safe_check(page):
+                    if not safe_check():
                         break
                     try:
                         t = page.title().lower()
-                        b = page.inner_text("body")[:200].lower()
+                        b = (await page.inner_text("body"))[:200].lower()
                         if "502" in t or "502 bad gateway" in b:
-                            z_sleep(10 + pa * 3)
-                            page.reload(wait_until="domcontentloaded")
-                            z_sleep(5)
+                            await z_sleep(10 + pa * 3)
+                            await page.reload(wait_until="domcontentloaded")
+                            await z_sleep(5)
                             continue
                         if "503" in t or "cloudflare" in b or "just a moment" in b:
-                            z_sleep(10 + pa * 3)
-                            page.reload(wait_until="domcontentloaded")
-                            z_sleep(5)
+                            await z_sleep(10 + pa * 3)
+                            await page.reload(wait_until="domcontentloaded")
+                            await z_sleep(5)
                             continue
                     except:
                         pass
                     try:
                         loc = "#captcha-img, .wrapper-capth, input[name='captchalogin'], img[src*='captcha']"
-                        page.locator(loc).first.wait_for(state="visible", timeout=30000)
+                        await page.locator(loc).first.wait_for(state="visible", timeout=30000)
                         captcha_detected = True
                         break
                     except:
                         pass
                     try:
-                        page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=20000)
+                        await page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=20000)
                         page_ready = True
                         break
                     except:
                         pass
                     session.log(f" Page not ready ({pa+1}/10)...")
                     try:
-                        page.reload(wait_until="domcontentloaded")
+                        await page.reload(wait_until="domcontentloaded")
                     except:
                         break
-                    z_sleep(10 + pa * 3)
+                    await z_sleep(10 + pa * 3)
                 else:
                     continue
                 if not captcha_detected and not page_ready:
@@ -1673,121 +1669,119 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
 
                 if captcha_detected:
                     session.log(f" Captcha slot (max {CAPTCHA_CONCURRENCY})...")
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, _captcha_semaphore.acquire)
                     try:
-                        _captcha_semaphore.acquire()
-                        try:
-                            captcha_solved = False
-                            for ca in range(20):
-                                if session.stop_event.is_set():
-                                    return
-                                if not safe_check(page):
-                                    break
+                        captcha_solved = False
+                        for ca in range(20):
+                            if session.stop_event.is_set():
+                                return
+                            if not safe_check():
+                                break
+                            try:
+                                ci = page.locator("#captcha-img, img[src*='CAPTCHA'], img[src*='captcha']")
                                 try:
-                                    ci = page.locator("#captcha-img, img[src*='CAPTCHA'], img[src*='captcha']")
+                                    await ci.first.wait_for(state="visible", timeout=10000)
+                                except:
+                                    await page.reload(wait_until="domcontentloaded")
+                                    await z_sleep(5)
+                                    continue
+                                session.log(f" Solving captcha ({ca+1})...")
+                                await z_sleep(2)
+                                answer = solve_captcha(await ci.first.screenshot())
+                                if not answer:
                                     try:
-                                        ci.first.wait_for(state="visible", timeout=10000)
+                                        await page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
                                     except:
-                                        page.reload(wait_until="domcontentloaded")
-                                        z_sleep(5)
+                                        await page.reload(wait_until="domcontentloaded")
+                                    await z_sleep(3)
+                                    continue
+                                session.log(f" Answer: '{answer}'")
+                                remove_overlays(page)
+                                await z_sleep(0.5)
+                                inp = page.locator("input[name='captchalogin'], input.captcha-login-input, input[placeholder='Enter the word']")
+                                try:
+                                    await inp.first.wait_for(state="visible", timeout=8000)
+                                except:
+                                    try:
+                                        await inp.first.wait_for(state="attached", timeout=5000)
+                                    except:
+                                        try:
+                                            await page.locator(".refresh-capthca-btn-new").first.click()
+                                        except:
+                                            await page.reload(wait_until="domcontentloaded")
+                                        await z_sleep(3)
                                         continue
-                                    session.log(f" Solving captcha ({ca+1})...")
-                                    z_sleep(2)
-                                    answer = solve_captcha(ci.first.screenshot())
-                                    if not answer:
+                                try:
+                                    await inp.first.fill(answer)
+                                except:
+                                    try:
+                                        await inp.first.click()
+                                        await z_sleep(0.2)
+                                        await page.keyboard.type(answer, delay=80)
+                                    except:
                                         try:
-                                            page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
+                                            await page.locator(".refresh-capthca-btn-new").first.click()
                                         except:
-                                            page.reload(wait_until="domcontentloaded")
-                                        z_sleep(3)
+                                            await page.reload(wait_until="domcontentloaded")
+                                        await z_sleep(3)
                                         continue
-                                    session.log(f" Answer: '{answer}'")
-                                    remove_overlays(page)
-                                    z_sleep(0.5)
-                                    inp = page.locator("input[name='captchalogin'], input.captcha-login-input, input[placeholder='Enter the word']")
+                                await z_sleep(0.5)
+                                remove_overlays(page)
+                                await z_sleep(0.3)
+                                await page.locator("button.submit-captcha").first.click()
+                                await z_sleep(5)
+                                try:
+                                    await page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=8000)
+                                    session.log(" Captcha solved!")
+                                    inject_anti_detection(page)
+                                    captcha_solved = True
+                                    break
+                                except:
+                                    session.log(f" Wrong answer '{answer}'...")
                                     try:
-                                        inp.first.wait_for(state="visible", timeout=8000)
+                                        await page.locator("#zbcd .btn-secondary, #zbcd button[data-dismiss='modal'], .modal.show .btn-secondary").first.click()
                                     except:
-                                        try:
-                                            inp.first.wait_for(state="attached", timeout=5000)
-                                        except:
-                                            try:
-                                                page.locator(".refresh-capthca-btn-new").first.click()
-                                            except:
-                                                page.reload(wait_until="domcontentloaded")
-                                            z_sleep(3)
-                                            continue
+                                        pass
+                                    await z_sleep(1)
                                     try:
-                                        inp.first.fill(answer)
+                                        await page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
                                     except:
-                                        try:
-                                            inp.first.click()
-                                            z_sleep(0.2)
-                                            page.keyboard.type(answer, delay=80)
-                                        except:
-                                            try:
-                                                page.locator(".refresh-capthca-btn-new").first.click()
-                                            except:
-                                                page.reload(wait_until="domcontentloaded")
-                                            z_sleep(3)
-                                            continue
-                                    z_sleep(0.5)
-                                    remove_overlays(page)
-                                    z_sleep(0.3)
-                                    page.locator("button.submit-captcha").first.click()
-                                    z_sleep(5)
-                                    try:
-                                        page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=8000)
-                                        session.log(" Captcha solved!")
-                                        inject_anti_detection(page)
-                                        captcha_solved = True
-                                        break
-                                    except:
-                                        session.log(f" Wrong answer '{answer}'...")
-                                        try:
-                                            page.locator("#zbcd .btn-secondary, #zbcd button[data-dismiss='modal'], .modal.show .btn-secondary").first.click()
-                                        except:
-                                            pass
-                                        z_sleep(1)
-                                        try:
-                                            page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
-                                        except:
-                                            pass
-                                        z_sleep(3)
-                                except Exception as e:
-                                    if is_dead(e):
-                                        break
-                                    z_sleep(2)
-                            if not captcha_solved:
-                                continue
-                        finally:
-                            _captcha_semaphore.release()
-                    except:
-                        continue
+                                        pass
+                                    await z_sleep(3)
+                            except Exception as e:
+                                if is_dead(e):
+                                    break
+                                await z_sleep(2)
+                        if not captcha_solved:
+                            continue
+                    finally:
+                        _captcha_semaphore.release()
 
                 # ---- Click service button ----
                 session.log(f"{emoji} Opening {svc_name} panel...")
                 try:
-                    page.locator(f".{btn_cls}").wait_for(timeout=30000)
+                    await page.locator(f".{btn_cls}").wait_for(timeout=30000)
                 except:
                     session.log(f" {svc_name} button not found.")
                     continue
                 try:
                     be = page.locator(f".{btn_cls}").first
-                    be.scroll_into_view_if_needed()
-                    z_sleep(0.5)
+                    await be.scroll_into_view_if_needed()
+                    await z_sleep(0.5)
                     remove_overlays(page)
-                    z_sleep(0.3)
+                    await z_sleep(0.3)
                     try:
-                        be.click(timeout=5000)
+                        await be.click(timeout=5000)
                     except:
                         remove_overlays(page)
-                        z_sleep(0.3)
-                        be.click(force=True, timeout=10000)
+                        await z_sleep(0.3)
+                        await be.click(force=True, timeout=10000)
                 except Exception as e:
                     if not is_dead(e):
                         session.log(f" Click: {e}")
                     continue
-                z_sleep(2)
+                await z_sleep(2)
                 inject_anti_detection(page)
                 session.log(f" {svc_name} panel opened!")
 
@@ -1796,71 +1790,70 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
 
                 # ---- Main Zefoy loop ----
                 while not session.stop_event.is_set():
-                    if not safe_check(page):
+                    if not safe_check():
                         session.log(" Page crashed, restarting...")
                         break
                     cycle = session.add_cycle()
                     try:
                         url_input = page.locator(input_panel_sel).first
                         try:
-                            url_input.wait_for(state="visible", timeout=5000)
+                            await url_input.wait_for(state="visible", timeout=5000)
                             input_fail_count = 0
                         except:
                             try:
                                 remove_overlays(page)
-                                z_sleep(0.3)
-                                page.locator(f".{btn_cls}").first.click(force=True)
-                                z_sleep(2)
-                                url_input.wait_for(state="visible", timeout=10000)
+                                await z_sleep(0.3)
+                                await page.locator(f".{btn_cls}").first.click(force=True)
+                                await z_sleep(2)
+                                await url_input.wait_for(state="visible", timeout=10000)
                                 input_fail_count = 0
                             except:
                                 input_fail_count += 1
                                 try:
-                                    bs = page.inner_text("body")[:300].lower()
+                                    bs = (await page.inner_text("body"))[:300].lower()
                                 except:
                                     break
                                 if "502" in bs or "bad gateway" in bs or "503" in bs:
                                     break
-                                if page.locator("#captcha-img, img[src*='captcha']").count() > 0:
+                                if await page.locator("#captcha-img, img[src*='captcha']").count() > 0:
                                     break
                                 if input_fail_count >= 5:
                                     break
-                                z_sleep(3)
+                                await z_sleep(3)
                                 continue
                             url_filled = False
                         if not url_filled:
-                            url_input.fill("")
-                            z_sleep(0.3)
-                            url_input.fill(session.video_url)
-                            z_sleep(1)
+                            await url_input.fill("")
+                            await z_sleep(0.3)
+                            await url_input.fill(session.video_url)
+                            await z_sleep(1)
                             url_filled = True
                         remove_overlays(page)
-                        z_sleep(0.3)
-                        page.locator(submit_panel_sel).first.click()
-                        z_sleep(3)
+                        await z_sleep(0.3)
+                        await page.locator(submit_panel_sel).first.click()
+                        await z_sleep(3)
                     except Exception as e:
                         if is_dead(e):
                             break
-                        z_sleep(3)
+                        await z_sleep(3)
                         continue
 
                     # ---- Comment Hearts fast search ----
                     if session.service == "comment_hearts":
                         target_user = session.username.lstrip('@').lower()
                         try:
-                            body_check = page.inner_text("body").lower()
+                            body_check = (await page.inner_text("body")).lower()
                         except:
                             break
                         if "too many" in body_check or "slow down" in body_check:
                             remove_overlays(page)
-                            z_sleep(0.3)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(3)
+                            await z_sleep(0.3)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(3)
                             continue
                         if "please wait" in body_check and ("minute" in body_check or "second" in body_check):
                             wt = parse_wait_time(body_check)
-                            if wt <= 0:
-                                wt = 60
+                            if wt <= 0: wt = 60
                             wt += 3
                             session.log(f" Countdown: {wt}s")
                             for r in range(wt, 0, -1):
@@ -1868,36 +1861,35 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                                     break
                                 m, s = r // 60, r % 60
                                 session.set_countdown(f" {m}m {s:02d}s" if m else f" {s}s")
-                                z_sleep(1)
+                                await z_sleep(1)
                             session.set_countdown("")
                             remove_overlays(page)
-                            z_sleep(0.3)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(3)
+                            await z_sleep(0.3)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(3)
                             continue
-                        if page.locator(".kadi-rengi").count() == 0:
+                        if await page.locator(".kadi-rengi").count() == 0:
                             try:
                                 cb = page.locator(f"{HEARTS_BTN_SEL}:visible, button.wbutton:visible").first
-                                cb.wait_for(state="visible", timeout=20000)
+                                await cb.wait_for(state="visible", timeout=20000)
                                 remove_overlays(page)
-                                z_sleep(0.3)
-                                cb.click()
-                                z_sleep(4)
+                                await z_sleep(0.3)
+                                await cb.click()
+                                await z_sleep(4)
                                 session.log(" Comments loaded")
                             except:
                                 remove_overlays(page)
-                                z_sleep(0.3)
-                                page.locator(submit_panel_sel).first.click()
-                                z_sleep(3)
+                                await z_sleep(0.3)
+                                await page.locator(submit_panel_sel).first.click()
+                                await z_sleep(3)
                                 continue
 
-                        # FAST paginated search (1.5s per page instead of 4s)
                         found_user = False
                         for pg in range(250):
                             if session.stop_event.is_set():
                                 break
                             try:
-                                result = page.evaluate("""(targetUser) => {
+                                result = await page.evaluate("""(targetUser) => {
                                     const forms = document.querySelectorAll('form.w1a');
                                     for (let i = 0; i < forms.length; i++) {
                                         const el = forms[i].querySelector('.kadi-rengi');
@@ -1911,24 +1903,24 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                                 }""", target_user)
                                 if result.get('found'):
                                     form_loc = page.locator("form.w1a").nth(result['index'])
-                                    form_loc.locator("select[name='select_lmt']").select_option("100")
-                                    z_sleep(0.5)
+                                    await form_loc.locator("select[name='select_lmt']").select_option("100")
+                                    await z_sleep(0.5)
                                     remove_overlays(page)
-                                    z_sleep(0.3)
-                                    form_loc.locator("button[type='submit']").click()
+                                    await z_sleep(0.3)
+                                    await form_loc.locator("button[type='submit']").click()
                                     session.log(f" Sent 100 hearts to @{target_user}")
                                     found_user = True
-                                    z_sleep(3)
+                                    await z_sleep(3)
                                     break
                                 if result.get('hasNext'):
                                     if pg == 0:
                                         session.log(f" Searching @{target_user}...")
-                                    page.locator('li[title="Next"] button').click()
+                                    await page.locator('li[title="Next"] button').click()
                                     try:
-                                        page.locator("form.w1a").first.wait_for(state="visible", timeout=3000)
+                                        await page.locator("form.w1a").first.wait_for(state="visible", timeout=3000)
                                     except:
                                         pass
-                                    z_sleep(1.5)
+                                    await z_sleep(1.5)
                                 else:
                                     session.log(f" @{target_user} not found")
                                     break
@@ -1938,14 +1930,14 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                                 session.log(f" Search: {e}")
                                 break
                         if not found_user:
-                            z_sleep(2)
+                            await z_sleep(2)
                             remove_overlays(page)
-                            z_sleep(0.3)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(3)
+                            await z_sleep(0.3)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(3)
                             continue
                         try:
-                            body = page.inner_text("body").lower()
+                            body = (await page.inner_text("body")).lower()
                         except:
                             break
                         if "successfully" in body:
@@ -1953,11 +1945,11 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                             session.log(f" +100 hearts to @{target_user} (total: {session.total_count})")
                         elif "too many" in body or "slow down" in body:
                             session.log(" Too many requests")
-                        z_sleep(2)
+                        await z_sleep(2)
                         remove_overlays(page)
-                        z_sleep(0.3)
-                        page.locator(submit_panel_sel).first.click()
-                        z_sleep(3)
+                        await z_sleep(0.3)
+                        await page.locator(submit_panel_sel).first.click()
+                        await z_sleep(3)
                         continue
 
                     # ---- Regular response handler ----
@@ -1965,44 +1957,43 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                         if session.stop_event.is_set():
                             break
                         try:
-                            body = page.inner_text("body")
+                            body = await page.inner_text("body")
                         except Exception as e:
                             if is_dead(e):
                                 break
-                            z_sleep(1)
+                            await z_sleep(1)
                             continue
                         lb = body.lower()
                         if "too many" in lb or "slow down" in lb:
-                            z_sleep(2)
+                            await z_sleep(2)
                             remove_overlays(page)
-                            z_sleep(0.3)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(3)
+                            await z_sleep(0.3)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(3)
                             continue
                         if "please wait" in lb and ("minute" in lb or "second" in lb):
                             wt = parse_wait_time(body)
-                            if wt <= 0:
-                                wt = 60
+                            if wt <= 0: wt = 60
                             wt += 3
                             for r in range(wt, 0, -1):
                                 if session.stop_event.is_set():
                                     break
                                 m, s = r // 60, r % 60
                                 session.set_countdown(f" {m}m {s:02d}s" if m else f" {s}s")
-                                z_sleep(1)
+                                await z_sleep(1)
                             session.set_countdown("")
                             remove_overlays(page)
-                            z_sleep(0.3)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(1)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(3)
+                            await z_sleep(0.3)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(1)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(3)
                             continue
                         if "ready" in lb and "next submit" in lb:
                             remove_overlays(page)
-                            z_sleep(0.3)
-                            page.locator(submit_panel_sel).first.click()
-                            z_sleep(3)
+                            await z_sleep(0.3)
+                            await page.locator(submit_panel_sel).first.click()
+                            await z_sleep(3)
                             continue
                         if "successfully" in lb:
                             count = 0
@@ -2018,7 +2009,7 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                         send_clicked = False
                         try:
                             remove_overlays(page)
-                            z_sleep(0.3)
+                            await z_sleep(0.3)
                             sels = []
                             if panel_sel:
                                 sels += [f'{panel_sel} {HEARTS_BTN_SEL}:visible', f'{panel_sel} button.btn-dark:visible', f'{panel_sel} button.wbutton:visible']
@@ -2026,15 +2017,15 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                             for sel in sels:
                                 try:
                                     btn = page.locator(sel).first
-                                    if btn.is_visible(timeout=1000):
-                                        btn.click()
+                                    if await btn.is_visible(timeout=1000):
+                                        await btn.click()
                                         send_clicked = True
-                                        z_sleep(3)
+                                        await z_sleep(3)
                                         break
                                 except:
                                     continue
                             if not send_clicked:
-                                send_clicked = page.evaluate("""() => {
+                                send_clicked = await page.evaluate("""() => {
                                     for (const b of document.querySelectorAll('button')) {
                                         if ((b.className.includes('btn-dark') || b.className.includes('wbutton')) && b.offsetWidth > 0) {
                                             b.click(); return true;
@@ -2043,16 +2034,16 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                                     return false;
                                 }""")
                                 if send_clicked:
-                                    z_sleep(3)
+                                    await z_sleep(3)
                             if send_clicked:
                                 continue
                         except:
                             pass
                         if check_i < 30:
-                            z_sleep(1)
+                            await z_sleep(1)
                         else:
                             break
-                    z_sleep(2)
+                    await z_sleep(2)
                     if cycle % 10 == 0:
                         _gc.collect()
 
@@ -2060,11 +2051,11 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                 if not is_dead(e):
                     session.log(f" Error: {e}")
             finally:
-                try:
-                    if page:
-                        page.close()
-                except:
-                    pass
+                if not page_closed:
+                    try:
+                        await page.close()
+                    except:
+                        pass
         session.log(" Page exhausted restarts.")
     except Exception as e:
         session.log(f" Page fatal: {e}")
@@ -2075,8 +2066,8 @@ def _run_bot_page(session, tab_id, browser, browser_idx):
                 session.status = "error"
 
 
-def _run_shared_browser(session, browser_idx):
-    """Launch one Chromium that handles multiple Zefoy pages."""
+async def _run_shared_browser_async(session, browser_idx):
+    """Launch one Chromium that handles multiple Zefoy pages (async)."""
     import gc as _gc
     start_id = browser_idx * PAGES_PER_BROWSER
     end_id = min(start_id + PAGES_PER_BROWSER, session.num_tabs)
@@ -2087,10 +2078,9 @@ def _run_shared_browser(session, browser_idx):
     session.log(f" [B{browser_idx+1}] Launching browser for {len(tab_ids)} pages...")
     got_slot = False
     browser = None
+    loop = asyncio.get_event_loop()
     try:
-        if not _browser_semaphore.acquire(timeout=1):
-            session.log(f" [B{browser_idx+1}] Waiting for browser slot...")
-            _browser_semaphore.acquire()
+        await loop.run_in_executor(None, _browser_semaphore.acquire)
         got_slot = True
         with _active_browsers_lock:
             global _active_browsers
@@ -2099,7 +2089,7 @@ def _run_shared_browser(session, browser_idx):
         pass
 
     try:
-        with sync_playwright() as p:
+        async with async_pw() as p:
             launch_opts = {
                 "headless": True,
                 "args": [
@@ -2122,26 +2112,28 @@ def _run_shared_browser(session, browser_idx):
                         break
                     if _tw == 0:
                         session.log(" Waiting for Tor...")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                 launch_opts["proxy"] = {"server": f"socks5://127.0.0.1:{tor_port}"}
             elif PROXY_URL:
                 launch_opts["proxy"] = {"server": PROXY_URL}
 
-            browser = p.chromium.launch(slow_mo=100, **launch_opts)
-            threads = []
+            browser = await p.chromium.launch(slow_mo=100, **launch_opts)
+            
+            # Create all pages upfront in this async context, then run concurrently
+            tasks = []
             for tid in tab_ids:
-                t = threading.Thread(target=_run_bot_page, args=(session, tid, browser, browser_idx), daemon=True)
-                t.start()
-                threads.append(t)
-                time.sleep(2)
-            for t in threads:
-                t.join()
+                page = await browser.new_page(viewport={"width": 800, "height": 600})
+                page.on("dialog", lambda d: d.accept())
+                tasks.append(asyncio.create_task(_run_page_async(session, page, tid, browser_idx)))
+                await asyncio.sleep(2)
+            
+            await asyncio.gather(*tasks)
     except Exception as e:
         session.log(f" [B{browser_idx+1}] Browser error: {e}")
     finally:
         try:
             if browser:
-                browser.close()
+                await browser.close()
         except:
             pass
         if got_slot:
@@ -2151,7 +2143,6 @@ def _run_shared_browser(session, browser_idx):
             got_slot = False
         _gc.collect()
     session.log(f" [B{browser_idx+1}] Browser finished")
-
 
 # 
 #  ROUTES
