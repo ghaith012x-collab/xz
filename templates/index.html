@@ -256,7 +256,6 @@ body::before {
     <div class="stats" id="globalStats">
         <span class="pill">Active <b id="statActive">0</b></span>
         <span class="pill">Sessions <b id="statTotal">0</b></span>
-        <span class="pill">🌐 Browsers <b id="statBrowsers">0</b></span>
     </div>
 </div>
 
@@ -487,7 +486,6 @@ function updateGlobalStats() {
     }
     document.getElementById('statActive').textContent = active;
     document.getElementById('statTotal').textContent = total;
-    document.getElementById('statBrowsers').textContent = _globalBrowsers;
 }
 setInterval(() => {
     fetch('/sessions').then(r => r.json()).then(data => {
