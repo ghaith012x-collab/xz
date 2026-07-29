@@ -761,12 +761,19 @@ def run_session(session):
         actual_sessions = num_browsers * PAGES_PER_BROWSER
         session.log(f" Launching {num_browsers} browsers x {PAGES_PER_BROWSER} pages = {actual_sessions} sessions ({svc_name})...")
         import asyncio
-        for bi in range(num_browsers):
-            try:
-                asyncio.run(_run_shared_browser_async(session, bi))
-            except Exception as e:
-                session.log(f" [B{bi+1}] Fatal: {e}")
-            time.sleep(3)
+        async def _run_all_browsers():
+            tasks = []
+            for bi in range(num_browsers):
+                task = asyncio.create_task(_run_shared_browser_async(session, bi))
+                tasks.append(task)
+                await asyncio.sleep(3)
+            await asyncio.gather(*tasks)
+        try:
+            asyncio.run(_run_all_browsers())
+        except Exception as e:
+            session.log(f" [BROWSER] Fatal: {e}")
+            import traceback
+            traceback.print_exc()
     elif nt <= 1:
         session.log(f" Launching browser ({svc_name} mode)...")
         run_tab(session, 0)
