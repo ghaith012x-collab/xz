@@ -32,6 +32,10 @@ _browser_semaphore = threading.Semaphore(MAX_GLOBAL_BROWSERS)
 _active_browsers = 0
 _active_browsers_lock = threading.Lock()
 
+# Pages per browser (shared browser mode)
+# Each Chromium process handles this many Zefoy sessions
+PAGES_PER_BROWSER = int(os.environ.get("PAGES_PER_BROWSER", "10"))
+
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
     resource.setrlimit(resource.RLIMIT_NPROC, (hard, hard))
@@ -296,8 +300,11 @@ def load_dictionary():
 threading.Thread(target=load_dictionary, daemon=True).start()
 
 # 
-#  CAPTCHA SOLVER
+#  CAPTCHA SOLVER — ENHANCED
 # 
+import hashlib
+_captcha_cache = {}  # sha256 -> answer
+
 def remove_small_components(binary_arr, min_size=30):
     h, w = binary_arr.shape
     visited = np.zeros((h, w), dtype=bool)
@@ -321,27 +328,94 @@ def remove_small_components(binary_arr, min_size=30):
                         result[cy, cx] = 1
     return result
 
+def _image_hash(img_bytes):
+    return hashlib.sha256(img_bytes).hexdigest()[:16]
+
 def solve_captcha(img_bytes):
+    h = _image_hash(img_bytes)
+    if h in _captcha_cache:
+        print(f"[BOT] Captcha cache hit: '{_captcha_cache[h]}'", flush=True)
+        return _captcha_cache[h]
     with _ocr_semaphore:
-        return _solve_captcha_inner(img_bytes)
+        ans = _solve_captcha_inner(img_bytes)
+    if ans and len(ans) >= 3:
+        _captcha_cache[h] = ans
+    return ans
+
+def _levenstein_best(candidates, word_list):
+    """Pick the best candidate using Levenshtein-like scoring."""
+    from collections import Counter as _Cnt
+    if not candidates:
+        return None
+    freq = _Cnt(candidates)
+    word_set = set(word_list)
+    exact = [c for c in candidates if c in word_set]
+    if exact:
+        return _Cnt(exact).most_common(1)[0][0]
+    best_word = None
+    best_score = 0.0
+    seen = {}
+    for c, f in freq.items():
+        from difflib import SequenceMatcher as SM
+        # Compare against all words, keep best
+        for w in word_list:
+            if abs(len(c) - len(w)) > 3:
+                continue
+            sim = SM(None, c, w).ratio()
+            score = sim * f
+            if score > best_score:
+                best_score = score
+                best_word = w
+                seen[c] = w
+    if best_word and best_score >= 1.2:
+        return best_word
+    return None
+
+def _otsu_threshold(arr):
+    """Compute Otsu threshold from numpy array."""
+    hist, _ = np.histogram(arr, bins=256, range=(0, 256))
+    total = arr.size
+    sum_total = np.dot(np.arange(256), hist)
+    sum_b = 0
+    w_b = 0
+    w_f = 0
+    var_max = 0
+    threshold = 128
+    for t in range(256):
+        w_b += hist[t]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += t * hist[t]
+        m_b = sum_b / w_b
+        m_f = (sum_total - sum_b) / w_f
+        var_between = w_b * w_f * (m_b - m_f) ** 2
+        if var_between > var_max:
+            var_max = var_between
+            threshold = t
+    return threshold
 
 def _solve_captcha_inner(img_bytes):
     import pytesseract
-    from PIL import ImageFilter, ImageEnhance
+    from PIL import ImageFilter, ImageEnhance, ImageOps as IOp
+    from scipy.ndimage import morphology as morph
+    
     img = Image.open(BytesIO(img_bytes))
     if img.mode != 'RGB':
         img = img.convert('RGB')
-    gray = ImageOps.grayscale(img)
+    gray = IOp.grayscale(img)
     w, h = gray.size
     big = gray.resize((w * 4, h * 4), Image.LANCZOS)
     arr = np.array(big)
-    results = []
+    candidates = []
 
     def run_ocr(pil_img, tag=""):
         found = []
-        for psm in [7, 8, 13, 6]:
+        for psm in [7, 8, 13, 6, 3]:
             config = f'--psm {psm} --oem 3 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyz'
-            for attempt in range(4):
+            for attempt in range(3):
                 try:
                     text = pytesseract.image_to_string(pil_img, config=config).strip()
                     text = re.sub(r'[^a-z]', '', text.lower())
@@ -351,93 +425,107 @@ def _solve_captcha_inner(img_bytes):
                 except Exception as ocr_err:
                     err_str = str(ocr_err).lower()
                     if "eagain" in err_str or "resource temporarily unavailable" in err_str or "errno 11" in err_str:
-                        if attempt < 3:
-                            backoff = 0.3 * (attempt + 1)
-                            print(f"[BOT] OCR {tag} psm={psm} EAGAIN, retrying in {backoff}s (attempt {attempt+1}/4)...", flush=True)
-                            time.sleep(backoff)
+                        if attempt < 2:
+                            time.sleep(0.3 * (attempt + 1))
                             continue
-                        else:
-                            print(f"[BOT] OCR {tag} psm={psm} EAGAIN exhausted after 4 attempts", flush=True)
-                    else:
-                        print(f"[BOT] OCR {tag} psm={psm} error: {ocr_err}", flush=True)
                     break
         return found
 
-    for thresh_val in [100, 120, 140, 160, 180, 200]:
+    # 1. Otsu adaptive threshold (best for varied lighting)
+    try:
+        otsu_t = _otsu_threshold(arr)
+        otsu_bin = Image.fromarray(((arr >= otsu_t) * 255).astype('uint8'))
+        candidates.extend(run_ocr(otsu_bin, "otsu"))
+    except:
+        pass
+
+    # 2. Multiple fixed thresholds (broad coverage)
+    for thresh_val in range(90, 211, 20):
         binary_img = Image.fromarray(((arr >= thresh_val) * 255).astype('uint8'))
-        results.extend(run_ocr(binary_img, f"thresh-{thresh_val}"))
+        candidates.extend(run_ocr(binary_img, f"th-{thresh_val}"))
 
-    for thresh_val in [100, 130, 160]:
+    # 3. Inverted thresholds (for dark text on light bg)
+    for thresh_val in [90, 120, 150, 180]:
         binary_img = Image.fromarray(((arr < thresh_val) * 255).astype('uint8'))
-        results.extend(run_ocr(binary_img, f"inv-{thresh_val}"))
+        candidates.extend(run_ocr(binary_img, f"inv-{thresh_val}"))
 
+    # 4. Noise-cleaned with component removal
     for thresh_val in [110, 130, 150, 170]:
         binary = (arr < thresh_val).astype(np.uint8)
-        cleaned = remove_small_components(binary, min_size=25)
+        cleaned = remove_small_components(binary, min_size=20)
         clean_img = Image.fromarray(((1 - cleaned) * 255).astype('uint8'))
-        results.extend(run_ocr(clean_img, f"clean-{thresh_val}"))
+        candidates.extend(run_ocr(clean_img, f"clean-{thresh_val}"))
 
+    # 5. Contrast-enhanced
     try:
         enhanced = ImageEnhance.Contrast(big).enhance(3.0)
-        enhanced_arr = np.array(enhanced)
-        for thresh_val in [120, 150, 180]:
-            binary_img = Image.fromarray(((enhanced_arr >= thresh_val) * 255).astype('uint8'))
-            results.extend(run_ocr(binary_img, f"contrast-{thresh_val}"))
+        ext_arr = np.array(enhanced)
+        for thresh_val in range(100, 201, 25):
+            binary_img = Image.fromarray(((ext_arr >= thresh_val) * 255).astype('uint8'))
+            candidates.extend(run_ocr(binary_img, f"contr-{thresh_val}"))
     except:
         pass
 
+    # 6. Median-blurred (removes salt-and-pepper noise)
     try:
         median = big.filter(ImageFilter.MedianFilter(size=3))
-        median_arr = np.array(median)
-        for thresh_val in [120, 150]:
-            binary_img = Image.fromarray(((median_arr >= thresh_val) * 255).astype('uint8'))
-            results.extend(run_ocr(binary_img, f"median-{thresh_val}"))
+        med_arr = np.array(median)
+        for thresh_val in [100, 130, 160]:
+            binary_img = Image.fromarray(((med_arr >= thresh_val) * 255).astype('uint8'))
+            candidates.extend(run_ocr(binary_img, f"med-{thresh_val}"))
     except:
         pass
 
+    # 7. Morphological cleanup (closing gaps in letters)
     try:
-        for thresh_val in [130, 160]:
+        for thresh_val in [120, 140, 160]:
             binary = (arr < thresh_val).astype(np.uint8)
-            cleaned = remove_small_components(binary, min_size=20)
-            from PIL import ImageFilter
-            tmp_img = Image.fromarray((cleaned * 255).astype('uint8'))
-            tmp_img = tmp_img.filter(ImageFilter.MaxFilter(3))
-            tmp_img = tmp_img.filter(ImageFilter.MinFilter(3))
-            inv_img = ImageOps.invert(tmp_img)
-            results.extend(run_ocr(inv_img, f"morph-{thresh_val}"))
+            cleaned = remove_small_components(binary, min_size=15)
+            # Morphological close to join broken characters
+            from scipy.ndimage import binary_closing
+            closed = binary_closing(cleaned, structure=np.ones((3,3)))
+            closed_img = Image.fromarray(((1 - closed) * 255).astype('uint8'))
+            candidates.extend(run_ocr(closed_img, f"morph-{thresh_val}"))
+    except ImportError:
+        # Fallback without scipy
+        try:
+            for thresh_val in [120, 140, 160]:
+                binary = (arr < thresh_val).astype(np.uint8)
+                cleaned = remove_small_components(binary, min_size=15)
+                from PIL import ImageFilter as _IF
+                tmp = Image.fromarray((cleaned * 255).astype('uint8'))
+                tmp = tmp.filter(_IF.MaxFilter(3)).filter(_IF.MinFilter(3))
+                inv = IOp.invert(tmp)
+                candidates.extend(run_ocr(inv, f"morph2-{thresh_val}"))
+        except:
+            pass
     except:
         pass
 
-    print(f"[BOT] OCR candidates: {results}", flush=True)
-    if not results:
+    # 8. Bilateral-like smoothing via blur + threshold
+    try:
+        blurred = big.filter(ImageFilter.GaussianBlur(radius=1))
+        blr_arr = np.array(blurred)
+        for thresh_val in [110, 140, 170]:
+            binary_img = Image.fromarray(((blr_arr >= thresh_val) * 255).astype('uint8'))
+            candidates.extend(run_ocr(binary_img, f"blur-{thresh_val}"))
+    except:
+        pass
+
+    print(f"[BOT] OCR candidates ({len(candidates)}): {candidates[:30]}{'...' if len(candidates)>30 else ''}", flush=True)
+    if not candidates:
         return ""
 
+    # Use Levenshtein voting
     if WORD_LIST:
-        word_set = set(WORD_LIST)
-        exact_matches = [r for r in results if r in word_set]
-        if exact_matches:
-            best = Counter(exact_matches).most_common(1)[0][0]
-            print(f"[BOT] OCR exact match: '{best}' (count={Counter(exact_matches)[best]})", flush=True)
+        best = _levenstein_best(candidates, WORD_LIST)
+        if best:
+            print(f"[BOT] OCR best: '{best}'", flush=True)
             return best
-        best_match = None
-        best_score = 0
-        best_raw = ""
-        for candidate in set(results):
-            freq = results.count(candidate)
-            matches = difflib.get_close_matches(candidate, WORD_LIST, n=1, cutoff=0.6)
-            if matches:
-                sim = difflib.SequenceMatcher(None, candidate, matches[0]).ratio()
-                score = freq * sim
-                if score > best_score:
-                    best_score = score
-                    best_match = matches[0]
-                    best_raw = candidate
-        if best_match:
-            print(f"[BOT] OCR: '{best_raw}'  '{best_match}' (score={best_score:.2f})", flush=True)
-            return best_match
 
-    most_common = Counter(results).most_common(1)[0][0]
-    print(f"[BOT] OCR fallback (no dict match): '{most_common}'", flush=True)
+    # Fallback: most common candidate
+    most_common = Counter(candidates).most_common(1)[0][0]
+    print(f"[BOT] OCR fallback: '{most_common}'", flush=True)
     return most_common
 
 def parse_wait_time(text):
@@ -537,7 +625,7 @@ class Session:
         self.video_url = video_url
         self.service = service
         self.username = username
-        self.num_tabs = max(1, min(num_tabs, 20))
+        self.num_tabs = max(1, min(num_tabs, 50))
         self.status = "starting"
         self.total_count = 0
         self.cycles = 0
@@ -635,7 +723,22 @@ def run_session(session):
     session.status = "running"
     svc_name = session.svc["name"]
     nt = session.num_tabs
-    if nt <= 1:
+
+    # Use shared browser mode when beneficial (PAGES_PER_BROWSER > 1 and multiple sessions)
+    if PAGES_PER_BROWSER > 1 and nt > 1:
+        import math as _math
+        num_browsers = max(1, _math.ceil(nt / PAGES_PER_BROWSER))
+        actual_sessions = num_browsers * PAGES_PER_BROWSER
+        session.log(f" Launching {num_browsers} browsers x {PAGES_PER_BROWSER} pages = {actual_sessions} sessions ({svc_name})...")
+        threads = []
+        for bi in range(num_browsers):
+            t = threading.Thread(target=_run_shared_browser, args=(session, bi), daemon=True)
+            t.start()
+            threads.append(t)
+            time.sleep(3)
+        for t in threads:
+            t.join()
+    elif nt <= 1:
         session.log(f" Launching browser ({svc_name} mode)...")
         run_tab(session, 0)
     else:
@@ -1181,7 +1284,11 @@ def run_tab(session, tab_id):
                                         if pg == 0:
                                             session.log(f" @{target_user} not on page 1, paginating...")
                                         page.locator('li[title="Next"] button').click()
-                                        z_sleep(4)
+                                        try:
+                                            page.locator("form.w1a").first.wait_for(state="visible", timeout=3000)
+                                        except:
+                                            pass
+                                        z_sleep(1.5)
                                     else:
                                         total_scanned = (pg * 40) + result.get('total', 0)
                                         session.log(f" @{target_user} not found in {total_scanned} comments ({pg + 1} pages)")
@@ -1448,6 +1555,603 @@ def run_tab(session, tab_id):
             session.active_tabs = max(0, session.active_tabs - 1)
             if session.active_tabs <= 0 and session.status == "running":
                 session.status = "error"
+
+
+# 
+#  SHARED BROWSER MODE — multiple Zefoy sessions per Chromium process
+# 
+def _run_bot_page(session, tab_id, browser, browser_idx):
+    """Run one Zefoy session using a shared browser's page."""
+    import gc as _gc
+    import time as _time
+    if tab_id not in session.video_buffers:
+        session.video_buffers[tab_id] = FrameBuffer()
+
+    svc = session.svc
+    svc_name = svc["name"]
+    btn_cls = svc["button_class"]
+    menu_cls = svc.get("menu_class", "")
+    unit = svc["unit"]
+    emoji = svc["emoji"]
+    panel_sel = f".{menu_cls}" if menu_cls else ""
+    input_panel_sel = f".{menu_cls} input[placeholder='Enter Video URL']:visible" if menu_cls else 'input[placeholder="Enter Video URL"]:visible, input[type="search"]:visible'
+    submit_panel_sel = f".{menu_cls} button[type='submit']" if menu_cls else 'button:has-text("Search"):visible'
+    multi = session.num_tabs > 1
+    _tab_prefix.value = f"[P{tab_id+1}] " if multi else ""
+
+    def z_sleep(seconds):
+        if session.stop_event.is_set():
+            raise Exception("Session stopped")
+        if seconds <= 0:
+            return
+        end_t = _time.time() + seconds
+        while _time.time() < end_t:
+            if session.stop_event.is_set():
+                raise Exception("Session stopped")
+            _time.sleep(min(0.5, end_t - _time.time()))
+
+    with session.count_lock:
+        session.active_tabs += 1
+    try:
+        for restart in range(50):
+            if session.stop_event.is_set():
+                return
+            if restart > 0:
+                z_sleep(5)
+
+            page = None
+            try:
+                page = browser.new_page(viewport={"width": 800, "height": 600})
+                page.on("dialog", lambda d: d.accept())
+
+                def safe_check(pg):
+                    try:
+                        pg.title()
+                        return True
+                    except:
+                        return False
+
+                session.log(" Loading zefoy.com...")
+                try:
+                    page.goto(ZEFOY, wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    session.log(f" Load error: {e}")
+                    continue
+
+                z_sleep(5)
+                inject_anti_detection(page)
+                if not safe_check(page):
+                    continue
+
+                # ---- Captcha handling ----
+                session.log(" Checking for captcha...")
+                captcha_detected = False
+                page_ready = False
+                for pa in range(10):
+                    if session.stop_event.is_set():
+                        return
+                    if not safe_check(page):
+                        break
+                    try:
+                        t = page.title().lower()
+                        b = page.inner_text("body")[:200].lower()
+                        if "502" in t or "502 bad gateway" in b:
+                            z_sleep(10 + pa * 3)
+                            page.reload(wait_until="domcontentloaded")
+                            z_sleep(5)
+                            continue
+                        if "503" in t or "cloudflare" in b or "just a moment" in b:
+                            z_sleep(10 + pa * 3)
+                            page.reload(wait_until="domcontentloaded")
+                            z_sleep(5)
+                            continue
+                    except:
+                        pass
+                    try:
+                        loc = "#captcha-img, .wrapper-capth, input[name='captchalogin'], img[src*='captcha']"
+                        page.locator(loc).first.wait_for(state="visible", timeout=30000)
+                        captcha_detected = True
+                        break
+                    except:
+                        pass
+                    try:
+                        page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=20000)
+                        page_ready = True
+                        break
+                    except:
+                        pass
+                    session.log(f" Page not ready ({pa+1}/10)...")
+                    try:
+                        page.reload(wait_until="domcontentloaded")
+                    except:
+                        break
+                    z_sleep(10 + pa * 3)
+                else:
+                    continue
+                if not captcha_detected and not page_ready:
+                    continue
+
+                if captcha_detected:
+                    session.log(f" Captcha slot (max {CAPTCHA_CONCURRENCY})...")
+                    try:
+                        _captcha_semaphore.acquire()
+                        try:
+                            captcha_solved = False
+                            for ca in range(20):
+                                if session.stop_event.is_set():
+                                    return
+                                if not safe_check(page):
+                                    break
+                                try:
+                                    ci = page.locator("#captcha-img, img[src*='CAPTCHA'], img[src*='captcha']")
+                                    try:
+                                        ci.first.wait_for(state="visible", timeout=10000)
+                                    except:
+                                        page.reload(wait_until="domcontentloaded")
+                                        z_sleep(5)
+                                        continue
+                                    session.log(f" Solving captcha ({ca+1})...")
+                                    z_sleep(2)
+                                    answer = solve_captcha(ci.first.screenshot())
+                                    if not answer:
+                                        try:
+                                            page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
+                                        except:
+                                            page.reload(wait_until="domcontentloaded")
+                                        z_sleep(3)
+                                        continue
+                                    session.log(f" Answer: '{answer}'")
+                                    remove_overlays(page)
+                                    z_sleep(0.5)
+                                    inp = page.locator("input[name='captchalogin'], input.captcha-login-input, input[placeholder='Enter the word']")
+                                    try:
+                                        inp.first.wait_for(state="visible", timeout=8000)
+                                    except:
+                                        try:
+                                            inp.first.wait_for(state="attached", timeout=5000)
+                                        except:
+                                            try:
+                                                page.locator(".refresh-capthca-btn-new").first.click()
+                                            except:
+                                                page.reload(wait_until="domcontentloaded")
+                                            z_sleep(3)
+                                            continue
+                                    try:
+                                        inp.first.fill(answer)
+                                    except:
+                                        try:
+                                            inp.first.click()
+                                            z_sleep(0.2)
+                                            page.keyboard.type(answer, delay=80)
+                                        except:
+                                            try:
+                                                page.locator(".refresh-capthca-btn-new").first.click()
+                                            except:
+                                                page.reload(wait_until="domcontentloaded")
+                                            z_sleep(3)
+                                            continue
+                                    z_sleep(0.5)
+                                    remove_overlays(page)
+                                    z_sleep(0.3)
+                                    page.locator("button.submit-captcha").first.click()
+                                    z_sleep(5)
+                                    try:
+                                        page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=8000)
+                                        session.log(" Captcha solved!")
+                                        inject_anti_detection(page)
+                                        captcha_solved = True
+                                        break
+                                    except:
+                                        session.log(f" Wrong answer '{answer}'...")
+                                        try:
+                                            page.locator("#zbcd .btn-secondary, #zbcd button[data-dismiss='modal'], .modal.show .btn-secondary").first.click()
+                                        except:
+                                            pass
+                                        z_sleep(1)
+                                        try:
+                                            page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
+                                        except:
+                                            pass
+                                        z_sleep(3)
+                                except Exception as e:
+                                    if is_dead(e):
+                                        break
+                                    z_sleep(2)
+                            if not captcha_solved:
+                                continue
+                        finally:
+                            _captcha_semaphore.release()
+                    except:
+                        continue
+
+                # ---- Click service button ----
+                session.log(f"{emoji} Opening {svc_name} panel...")
+                try:
+                    page.locator(f".{btn_cls}").wait_for(timeout=30000)
+                except:
+                    session.log(f" {svc_name} button not found.")
+                    continue
+                try:
+                    be = page.locator(f".{btn_cls}").first
+                    be.scroll_into_view_if_needed()
+                    z_sleep(0.5)
+                    remove_overlays(page)
+                    z_sleep(0.3)
+                    try:
+                        be.click(timeout=5000)
+                    except:
+                        remove_overlays(page)
+                        z_sleep(0.3)
+                        be.click(force=True, timeout=10000)
+                except Exception as e:
+                    if not is_dead(e):
+                        session.log(f" Click: {e}")
+                    continue
+                z_sleep(2)
+                inject_anti_detection(page)
+                session.log(f" {svc_name} panel opened!")
+
+                url_filled = False
+                input_fail_count = 0
+
+                # ---- Main Zefoy loop ----
+                while not session.stop_event.is_set():
+                    if not safe_check(page):
+                        session.log(" Page crashed, restarting...")
+                        break
+                    cycle = session.add_cycle()
+                    try:
+                        url_input = page.locator(input_panel_sel).first
+                        try:
+                            url_input.wait_for(state="visible", timeout=5000)
+                            input_fail_count = 0
+                        except:
+                            try:
+                                remove_overlays(page)
+                                z_sleep(0.3)
+                                page.locator(f".{btn_cls}").first.click(force=True)
+                                z_sleep(2)
+                                url_input.wait_for(state="visible", timeout=10000)
+                                input_fail_count = 0
+                            except:
+                                input_fail_count += 1
+                                try:
+                                    bs = page.inner_text("body")[:300].lower()
+                                except:
+                                    break
+                                if "502" in bs or "bad gateway" in bs or "503" in bs:
+                                    break
+                                if page.locator("#captcha-img, img[src*='captcha']").count() > 0:
+                                    break
+                                if input_fail_count >= 5:
+                                    break
+                                z_sleep(3)
+                                continue
+                            url_filled = False
+                        if not url_filled:
+                            url_input.fill("")
+                            z_sleep(0.3)
+                            url_input.fill(session.video_url)
+                            z_sleep(1)
+                            url_filled = True
+                        remove_overlays(page)
+                        z_sleep(0.3)
+                        page.locator(submit_panel_sel).first.click()
+                        z_sleep(3)
+                    except Exception as e:
+                        if is_dead(e):
+                            break
+                        z_sleep(3)
+                        continue
+
+                    # ---- Comment Hearts fast search ----
+                    if session.service == "comment_hearts":
+                        target_user = session.username.lstrip('@').lower()
+                        try:
+                            body_check = page.inner_text("body").lower()
+                        except:
+                            break
+                        if "too many" in body_check or "slow down" in body_check:
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(3)
+                            continue
+                        if "please wait" in body_check and ("minute" in body_check or "second" in body_check):
+                            wt = parse_wait_time(body_check)
+                            if wt <= 0:
+                                wt = 60
+                            wt += 3
+                            session.log(f" Countdown: {wt}s")
+                            for r in range(wt, 0, -1):
+                                if session.stop_event.is_set():
+                                    break
+                                m, s = r // 60, r % 60
+                                session.set_countdown(f" {m}m {s:02d}s" if m else f" {s}s")
+                                z_sleep(1)
+                            session.set_countdown("")
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(3)
+                            continue
+                        if page.locator(".kadi-rengi").count() == 0:
+                            try:
+                                cb = page.locator(f"{HEARTS_BTN_SEL}:visible, button.wbutton:visible").first
+                                cb.wait_for(state="visible", timeout=20000)
+                                remove_overlays(page)
+                                z_sleep(0.3)
+                                cb.click()
+                                z_sleep(4)
+                                session.log(" Comments loaded")
+                            except:
+                                remove_overlays(page)
+                                z_sleep(0.3)
+                                page.locator(submit_panel_sel).first.click()
+                                z_sleep(3)
+                                continue
+
+                        # FAST paginated search (1.5s per page instead of 4s)
+                        found_user = False
+                        for pg in range(250):
+                            if session.stop_event.is_set():
+                                break
+                            try:
+                                result = page.evaluate("""(targetUser) => {
+                                    const forms = document.querySelectorAll('form.w1a');
+                                    for (let i = 0; i < forms.length; i++) {
+                                        const el = forms[i].querySelector('.kadi-rengi');
+                                        if (!el) continue;
+                                        if (el.innerText.trim().replace('@','').toLowerCase() === targetUser) {
+                                            return {found: true, index: i};
+                                        }
+                                    }
+                                    const nb = document.querySelector('li[title="Next"] button');
+                                    return {found: false, hasNext: !!(nb && !nb.disabled)};
+                                }""", target_user)
+                                if result.get('found'):
+                                    form_loc = page.locator("form.w1a").nth(result['index'])
+                                    form_loc.locator("select[name='select_lmt']").select_option("100")
+                                    z_sleep(0.5)
+                                    remove_overlays(page)
+                                    z_sleep(0.3)
+                                    form_loc.locator("button[type='submit']").click()
+                                    session.log(f" Sent 100 hearts to @{target_user}")
+                                    found_user = True
+                                    z_sleep(3)
+                                    break
+                                if result.get('hasNext'):
+                                    if pg == 0:
+                                        session.log(f" Searching @{target_user}...")
+                                    page.locator('li[title="Next"] button').click()
+                                    try:
+                                        page.locator("form.w1a").first.wait_for(state="visible", timeout=3000)
+                                    except:
+                                        pass
+                                    z_sleep(1.5)
+                                else:
+                                    session.log(f" @{target_user} not found")
+                                    break
+                            except Exception as e:
+                                if is_dead(e):
+                                    break
+                                session.log(f" Search: {e}")
+                                break
+                        if not found_user:
+                            z_sleep(2)
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(3)
+                            continue
+                        try:
+                            body = page.inner_text("body").lower()
+                        except:
+                            break
+                        if "successfully" in body:
+                            session.add_count(100)
+                            session.log(f" +100 hearts to @{target_user} (total: {session.total_count})")
+                        elif "too many" in body or "slow down" in body:
+                            session.log(" Too many requests")
+                        z_sleep(2)
+                        remove_overlays(page)
+                        z_sleep(0.3)
+                        page.locator(submit_panel_sel).first.click()
+                        z_sleep(3)
+                        continue
+
+                    # ---- Regular response handler ----
+                    for check_i in range(60):
+                        if session.stop_event.is_set():
+                            break
+                        try:
+                            body = page.inner_text("body")
+                        except Exception as e:
+                            if is_dead(e):
+                                break
+                            z_sleep(1)
+                            continue
+                        lb = body.lower()
+                        if "too many" in lb or "slow down" in lb:
+                            z_sleep(2)
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(3)
+                            continue
+                        if "please wait" in lb and ("minute" in lb or "second" in lb):
+                            wt = parse_wait_time(body)
+                            if wt <= 0:
+                                wt = 60
+                            wt += 3
+                            for r in range(wt, 0, -1):
+                                if session.stop_event.is_set():
+                                    break
+                                m, s = r // 60, r % 60
+                                session.set_countdown(f" {m}m {s:02d}s" if m else f" {s}s")
+                                z_sleep(1)
+                            session.set_countdown("")
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(1)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(3)
+                            continue
+                        if "ready" in lb and "next submit" in lb:
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            page.locator(submit_panel_sel).first.click()
+                            z_sleep(3)
+                            continue
+                        if "successfully" in lb:
+                            count = 0
+                            for line in body.split('\n'):
+                                if 'successfully' in line.lower():
+                                    nums = [int(m) for m in re.findall(r'\d+', line) if not (2020 <= int(m) <= 2035) and int(m) < 100000]
+                                    if nums:
+                                        count = max(nums)
+                                    break
+                            new_total = session.add_count(count)
+                            session.log(f" +{count} {unit}! Total: {new_total:,}")
+                            break
+                        send_clicked = False
+                        try:
+                            remove_overlays(page)
+                            z_sleep(0.3)
+                            sels = []
+                            if panel_sel:
+                                sels += [f'{panel_sel} {HEARTS_BTN_SEL}:visible', f'{panel_sel} button.btn-dark:visible', f'{panel_sel} button.wbutton:visible']
+                            sels += [f'{HEARTS_BTN_SEL}:visible', 'button.btn-dark:visible', 'button.wbutton:visible']
+                            for sel in sels:
+                                try:
+                                    btn = page.locator(sel).first
+                                    if btn.is_visible(timeout=1000):
+                                        btn.click()
+                                        send_clicked = True
+                                        z_sleep(3)
+                                        break
+                                except:
+                                    continue
+                            if not send_clicked:
+                                send_clicked = page.evaluate("""() => {
+                                    for (const b of document.querySelectorAll('button')) {
+                                        if ((b.className.includes('btn-dark') || b.className.includes('wbutton')) && b.offsetWidth > 0) {
+                                            b.click(); return true;
+                                        }
+                                    }
+                                    return false;
+                                }""")
+                                if send_clicked:
+                                    z_sleep(3)
+                            if send_clicked:
+                                continue
+                        except:
+                            pass
+                        if check_i < 30:
+                            z_sleep(1)
+                        else:
+                            break
+                    z_sleep(2)
+                    if cycle % 10 == 0:
+                        _gc.collect()
+
+            except Exception as e:
+                if not is_dead(e):
+                    session.log(f" Error: {e}")
+            finally:
+                try:
+                    if page:
+                        page.close()
+                except:
+                    pass
+        session.log(" Page exhausted restarts.")
+    except Exception as e:
+        session.log(f" Page fatal: {e}")
+    finally:
+        with session.count_lock:
+            session.active_tabs = max(0, session.active_tabs - 1)
+            if session.active_tabs <= 0 and session.status == "running":
+                session.status = "error"
+
+
+def _run_shared_browser(session, browser_idx):
+    """Launch one Chromium that handles multiple Zefoy pages."""
+    import gc as _gc
+    start_id = browser_idx * PAGES_PER_BROWSER
+    end_id = min(start_id + PAGES_PER_BROWSER, session.num_tabs)
+    tab_ids = list(range(start_id, end_id))
+    if not tab_ids:
+        return
+
+    session.log(f" [B{browser_idx+1}] Launching browser for {len(tab_ids)} pages...")
+    got_slot = False
+    browser = None
+    try:
+        if not _browser_semaphore.acquire(timeout=1):
+            session.log(f" [B{browser_idx+1}] Waiting for browser slot...")
+            _browser_semaphore.acquire()
+        got_slot = True
+        with _active_browsers_lock:
+            global _active_browsers
+            _active_browsers += 1
+    except:
+        pass
+
+    try:
+        with sync_playwright() as p:
+            launch_opts = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--disable-extensions", "--disable-background-networking",
+                    "--disable-default-apps", "--disable-sync", "--disable-translate",
+                    "--no-first-run", "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+                    "--disable-component-extensions-with-background-pages",
+                    "--disable-features=TranslateUI", "--renderer-process-limit=1",
+                    "--js-flags=--max-old-space-size=128", "--disable-software-rasterizer",
+                    "--disable-logging", "--disable-hang-monitor",
+                    "--disable-ipc-flooding-protection", "--memory-pressure-off",
+                ],
+            }
+            if USING_TOR:
+                tor_port = 9050 + (browser_idx % 10)
+                for _tw in range(60):
+                    if os.path.exists("/tmp/tor_ready"):
+                        break
+                    if _tw == 0:
+                        session.log(" Waiting for Tor...")
+                    time.sleep(1)
+                launch_opts["proxy"] = {"server": f"socks5://127.0.0.1:{tor_port}"}
+            elif PROXY_URL:
+                launch_opts["proxy"] = {"server": PROXY_URL}
+
+            browser = p.chromium.launch(slow_mo=100, **launch_opts)
+            threads = []
+            for tid in tab_ids:
+                t = threading.Thread(target=_run_bot_page, args=(session, tid, browser, browser_idx), daemon=True)
+                t.start()
+                threads.append(t)
+                time.sleep(2)
+            for t in threads:
+                t.join()
+    except Exception as e:
+        session.log(f" [B{browser_idx+1}] Browser error: {e}")
+    finally:
+        try:
+            if browser:
+                browser.close()
+        except:
+            pass
+        if got_slot:
+            with _active_browsers_lock:
+                _active_browsers = max(0, _active_browsers - 1)
+            _browser_semaphore.release()
+            got_slot = False
+        _gc.collect()
+    session.log(f" [B{browser_idx+1}] Browser finished")
+
 
 # 
 #  ROUTES
