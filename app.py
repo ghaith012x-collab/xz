@@ -919,7 +919,7 @@ def run_tab(session, tab_id):
                         continue
 
                     z_sleep(5)
-                    await inject_anti_detection_async(page)
+                    inject_anti_detection(page)
                     if not safe_check(page):
                         session.log(" Page crashed on load, restarting...")
                         continue
@@ -1067,7 +1067,7 @@ def run_tab(session, tab_id):
                                         try:
                                             page.locator(ANY_SERVICE_BUTTON).first.wait_for(timeout=8000)
                                             session.log(" Captcha solved!")
-                                            await inject_anti_detection_async(page)
+                                            inject_anti_detection(page)
                                             captcha_solved = True
                                             break
                                         except:
@@ -1133,7 +1133,7 @@ def run_tab(session, tab_id):
                         continue
 
                     z_sleep(2)
-                    await inject_anti_detection_async(page)
+                    inject_anti_detection(page)
                     session.log(f" {svc_name} panel opened!")
                     backoff = 5
                     url_filled = False
