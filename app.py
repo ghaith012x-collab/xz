@@ -694,6 +694,23 @@ sessions_lock = threading.Lock()
 def capture_screenshot(page, quality=60, max_width=1280):
     try:
         screenshot_bytes = page.screenshot(type='jpeg', quality=quality)
+        return _resize_jpeg(screenshot_bytes, quality=quality, max_width=max_width)
+    except Exception as e:
+        print(f"[VIDEO] Screenshot error: {e}", flush=True)
+        return None
+
+async def capture_screenshot_async(page, quality=60, max_width=1280):
+    # Async version: MUST await page.screenshot() for async Playwright pages
+    try:
+        screenshot_bytes = await page.screenshot(type='jpeg', quality=quality)
+        return _resize_jpeg(screenshot_bytes, quality=quality, max_width=max_width)
+    except Exception as e:
+        print(f"[VIDEO] Async screenshot error: {e}", flush=True)
+        return None
+
+def _resize_jpeg(screenshot_bytes, quality=60, max_width=1280):
+    # Resize a JPEG screenshot if wider than max_width
+    try:
         img = Image.open(BytesIO(screenshot_bytes))
         if img.width > max_width:
             ratio = max_width / img.width
@@ -704,8 +721,8 @@ def capture_screenshot(page, quality=60, max_width=1280):
             return buf.getvalue()
         return screenshot_bytes
     except Exception as e:
-        print(f"[VIDEO] Screenshot error: {e}", flush=True)
-        return None
+        print(f"[VIDEO] Resize error: {e}", flush=True)
+        return screenshot_bytes
 
 def generate_mjpeg_stream(frame_buffer, fps=2):
     frame_interval = 1.0 / fps
@@ -1598,14 +1615,6 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
         while time.time() < end_t:
             if session.stop_event.is_set():
                 raise Exception("Session stopped")
-            # Capture live cam frames during sleep
-            try:
-                if page and not page.is_closed():
-                    frm = capture_screenshot(page, quality=30)
-                    if frm and tab_id in session.video_buffers:
-                        session.video_buffers[tab_id].add_frame(frm)
-            except Exception:
-                pass
             await asyncio.sleep(min(0.5, end_t - time.time()))
 
     with session.count_lock:
@@ -1641,6 +1650,28 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
                 continue
 
             page_closed = False
+
+            # Continuous live-cam capture task: screenshots ~2fps while page is alive
+            cam_task = None
+            async def _cam_loop():
+                try:
+                    while not session.stop_event.is_set():
+                        try:
+                            if page is not None and not page.is_closed():
+                                frm = await capture_screenshot_async(page, quality=30)
+                                if frm and tab_id in session.video_buffers:
+                                    session.video_buffers[tab_id].add_frame(frm)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+            try:
+                cam_task = asyncio.ensure_future(_cam_loop())
+            except Exception:
+                cam_task = None
+
             try:
                 # Navigate to zefoy
                 session.log(" Loading zefoy.com...")
@@ -2099,6 +2130,8 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
                 if not is_dead(e):
                     session.log(f" Error: {e}")
             finally:
+                if cam_task is not None:
+                    cam_task.cancel()
                 if not page_closed:
                     try:
                         await page.close()
@@ -2319,6 +2352,21 @@ def stream_all():
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
+_placeholder_frame = None
+
+def _get_placeholder_frame():
+    # Dark placeholder JPEG shown while waiting for the first real frame
+    global _placeholder_frame
+    if _placeholder_frame is None:
+        try:
+            buf = BytesIO()
+            img = Image.new("RGB", (160, 120), (8, 8, 18))
+            img.save(buf, format="JPEG", quality=40)
+            _placeholder_frame = buf.getvalue()
+        except Exception:
+            _placeholder_frame = b""
+    return _placeholder_frame
+
 @app.route("/stream/video/<int:sid>/<int:tab_id>")
 def stream_video(sid, tab_id):
     with sessions_lock:
@@ -2327,7 +2375,7 @@ def stream_video(sid, tab_id):
         return "Video not available", 404
     frame = session.video_buffers[tab_id].get_latest()
     if not frame:
-        return "No frame", 404
+        frame = _get_placeholder_frame()
     return Response(frame, mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
 
 @app.route("/tabs/<int:sid>")
