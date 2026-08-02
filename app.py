@@ -25,7 +25,7 @@ _tab_prefix = threading.local()
 # 
 #  CONCURRENCY LIMITS
 # 
-CAPTCHA_CONCURRENCY = int(os.environ.get("CAPTCHA_CONCURRENCY", "3"))
+CAPTCHA_CONCURRENCY = int(os.environ.get("CAPTCHA_CONCURRENCY", "1"))
 _captcha_semaphore = threading.Semaphore(CAPTCHA_CONCURRENCY)
 _ocr_semaphore = threading.Semaphore(CAPTCHA_CONCURRENCY)
 MAX_GLOBAL_BROWSERS = int(os.environ.get("MAX_GLOBAL_BROWSERS", "6"))
@@ -461,9 +461,9 @@ def _solve_captcha_inner(img_bytes):
                     break
                 except Exception as ocr_err:
                     err_str = str(ocr_err).lower()
-                    if "eagain" in err_str or "resource temporarily unavailable" in err_str or "errno 11" in err_str:
+                    if any(x in err_str for x in ("eagain", "resource temporarily unavailable", "errno 11", "can't start new thread", "thread")):
                         if attempt < 2:
-                            time.sleep(0.3 * (attempt + 1))
+                            time.sleep(0.5 * (attempt + 1))
                             continue
                     break
         return found
@@ -1074,7 +1074,7 @@ def run_tab(session, tab_id):
                                         z_sleep(2)
 
                                 if not captcha_solved:
-                                    session.log(" Captcha not solved after max attempts, restarting browser...")
+                                    session.log(" All captcha attempts failed (sync mode), restarting browser...")
                                     continue
                             finally:
                                 _captcha_semaphore.release()
@@ -1598,17 +1598,34 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
         while time.time() < end_t:
             if session.stop_event.is_set():
                 raise Exception("Session stopped")
+            # Capture live cam frames during sleep
+            try:
+                if page and not page.is_closed():
+                    frm = capture_screenshot(page, quality=30)
+                    if frm and tab_id in session.video_buffers:
+                        session.video_buffers[tab_id].add_frame(frm)
+            except Exception:
+                pass
             await asyncio.sleep(min(0.5, end_t - time.time()))
 
     with session.count_lock:
         session.active_tabs += 1
+    if tab_id not in session.video_buffers:
+        session.video_buffers[tab_id] = FrameBuffer()
     try:
         page = None
+        captcha_cycles = 0  # track total captcha retry cycles
         for restart in range(50):
             if session.stop_event.is_set():
                 return
             if restart > 0:
                 await z_sleep(5)
+            
+            # Hard cap: if captcha keeps failing after 4 full page-reload cycles, pause
+            if captcha_cycles >= 4:
+                session.log(" Captcha failed after 4 full retry cycles, pausing 60s...")
+                await z_sleep(60)
+                captcha_cycles = 0
 
             # Create a FRESH page from the shared browser on each restart
             try:
@@ -1718,13 +1735,14 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
                                 await z_sleep(2)
                                 answer = solve_captcha(await ci.first.screenshot())
                                 if not answer:
+                                    session.log("  OCR returned empty, refreshing captcha...")
                                     try:
                                         await page.locator(".refresh-capthca-btn-new, [onclick*='refresh']").first.click()
                                     except:
                                         await page.reload(wait_until="domcontentloaded")
                                     await z_sleep(3)
                                     continue
-                                session.log(f" Answer: '{answer}'")
+                                session.log(f" OCR answer: '{answer}'")
                                 await remove_overlays_async(page)
                                 await z_sleep(0.5)
                                 inp = page.locator("input[name='captchalogin'], input.captcha-login-input, input[placeholder='Enter the word']")
@@ -1782,6 +1800,8 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
                                     break
                                 await z_sleep(2)
                         if not captcha_solved:
+                            session.log(" All 8 captcha attempts failed, will retry on next page load...")
+                            captcha_cycles += 1
                             continue
                     finally:
                         _captcha_semaphore.release()

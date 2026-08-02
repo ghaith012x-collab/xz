@@ -335,6 +335,8 @@ function startSession() {
     .then(data => {
         if (data.error) return alert(data.error);
         createCard(data);
+        // Auto-show live camera for new sessions
+        setTimeout(() => toggleVideo(data.id), 1000);
     });
 }
 
