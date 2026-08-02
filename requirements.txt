@@ -6,3 +6,4 @@ gunicorn==21.2.0
 Pillow==10.1.0
 pytesseract==0.3.10
 numpy
+scipy
