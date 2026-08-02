@@ -361,15 +361,22 @@ def remove_small_components(binary_arr, min_size=30):
 def _image_hash(img_bytes):
     return hashlib.sha256(img_bytes).hexdigest()[:16]
 
+_captcha_fail_cache = {}  # sha256 -> True (known-bad images)
+
 def solve_captcha(img_bytes):
     h = _image_hash(img_bytes)
     if h in _captcha_cache:
         print(f"[BOT] Captcha cache hit: '{_captcha_cache[h]}'", flush=True)
         return _captcha_cache[h]
+    if h in _captcha_fail_cache:
+        print(f"[BOT] Captcha fail-cache hit (known bad image), skipping OCR", flush=True)
+        return ""
     with _ocr_semaphore:
         ans = _solve_captcha_inner(img_bytes)
     if ans and len(ans) >= 3:
         _captcha_cache[h] = ans
+    else:
+        _captcha_fail_cache[h] = True
     return ans
 
 def _levenstein_best(candidates, word_list):
@@ -444,11 +451,11 @@ def _solve_captcha_inner(img_bytes):
     def run_ocr(pil_img, tag=""):
         found = []
         for psm in [7, 8, 13, 6, 3]:
-            config = f'--psm {psm} --oem 3 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyz'
-            for attempt in range(3):
+            config = f'--psm {psm} --oem 3 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyz0123456789'
+            for attempt in range(2):
                 try:
                     text = pytesseract.image_to_string(pil_img, config=config).strip()
-                    text = re.sub(r'[^a-z]', '', text.lower())
+                    text = re.sub(r'[^a-z0-9]', '', text.lower())
                     if 3 <= len(text) <= 12:
                         found.append(text)
                     break
@@ -469,78 +476,48 @@ def _solve_captcha_inner(img_bytes):
     except:
         pass
 
-    # 2. Multiple fixed thresholds (broad coverage)
+    # 2. Multiple fixed thresholds (broad coverage) — early exit once we have enough
     for thresh_val in range(90, 211, 20):
         binary_img = Image.fromarray(((arr >= thresh_val) * 255).astype('uint8'))
-        candidates.extend(run_ocr(binary_img, f"th-{thresh_val}"))
+        new = run_ocr(binary_img, f"th-{thresh_val}")
+        candidates.extend(new)
+        if len(candidates) >= 15 and len(set(candidates)) >= 2:
+            break
 
-    # 3. Inverted thresholds (for dark text on light bg)
-    for thresh_val in [90, 120, 150, 180]:
-        binary_img = Image.fromarray(((arr < thresh_val) * 255).astype('uint8'))
-        candidates.extend(run_ocr(binary_img, f"inv-{thresh_val}"))
+    # 3-8: Additional strategies only if we don't have enough candidates yet
+    if len(set(candidates)) < 3:
+        # 3. Inverted thresholds (for dark text on light bg)
+        for thresh_val in [90, 120, 150]:
+            binary_img = Image.fromarray(((arr < thresh_val) * 255).astype('uint8'))
+            new = run_ocr(binary_img, f"inv-{thresh_val}")
+            candidates.extend(new)
+            if len(candidates) >= 15 and len(set(candidates)) >= 3:
+                break
 
-    # 4. Noise-cleaned with component removal
-    for thresh_val in [110, 130, 150, 170]:
-        binary = (arr < thresh_val).astype(np.uint8)
-        cleaned = remove_small_components(binary, min_size=20)
-        clean_img = Image.fromarray(((1 - cleaned) * 255).astype('uint8'))
-        candidates.extend(run_ocr(clean_img, f"clean-{thresh_val}"))
+        # 4. Contrast-enhanced
+        if len(set(candidates)) < 3:
+            try:
+                enhanced = ImageEnhance.Contrast(big).enhance(3.0)
+                ext_arr = np.array(enhanced)
+                for thresh_val in [100, 140, 180]:
+                    binary_img = Image.fromarray(((ext_arr >= thresh_val) * 255).astype('uint8'))
+                    new = run_ocr(binary_img, f"contr-{thresh_val}")
+                    candidates.extend(new)
+                    if len(candidates) >= 15:
+                        break
+            except:
+                pass
 
-    # 5. Contrast-enhanced
-    try:
-        enhanced = ImageEnhance.Contrast(big).enhance(3.0)
-        ext_arr = np.array(enhanced)
-        for thresh_val in range(100, 201, 25):
-            binary_img = Image.fromarray(((ext_arr >= thresh_val) * 255).astype('uint8'))
-            candidates.extend(run_ocr(binary_img, f"contr-{thresh_val}"))
-    except:
-        pass
-
-    # 6. Median-blurred (removes salt-and-pepper noise)
-    try:
-        median = big.filter(ImageFilter.MedianFilter(size=3))
-        med_arr = np.array(median)
-        for thresh_val in [100, 130, 160]:
-            binary_img = Image.fromarray(((med_arr >= thresh_val) * 255).astype('uint8'))
-            candidates.extend(run_ocr(binary_img, f"med-{thresh_val}"))
-    except:
-        pass
-
-    # 7. Morphological cleanup (closing gaps in letters)
-    try:
-        for thresh_val in [120, 140, 160]:
-            binary = (arr < thresh_val).astype(np.uint8)
-            cleaned = remove_small_components(binary, min_size=15)
-            # Morphological close to join broken characters
-            from scipy.ndimage import binary_closing
-            closed = binary_closing(cleaned, structure=np.ones((3,3)))
-            closed_img = Image.fromarray(((1 - closed) * 255).astype('uint8'))
-            candidates.extend(run_ocr(closed_img, f"morph-{thresh_val}"))
-    except ImportError:
-        # Fallback without scipy
-        try:
-            for thresh_val in [120, 140, 160]:
+        # 5. Noise-cleaned with component removal
+        if len(set(candidates)) < 3:
+            for thresh_val in [110, 150]:
                 binary = (arr < thresh_val).astype(np.uint8)
-                cleaned = remove_small_components(binary, min_size=15)
-                from PIL import ImageFilter as _IF
-                tmp = Image.fromarray((cleaned * 255).astype('uint8'))
-                tmp = tmp.filter(_IF.MaxFilter(3)).filter(_IF.MinFilter(3))
-                inv = IOp.invert(tmp)
-                candidates.extend(run_ocr(inv, f"morph2-{thresh_val}"))
-        except:
-            pass
-    except:
-        pass
-
-    # 8. Bilateral-like smoothing via blur + threshold
-    try:
-        blurred = big.filter(ImageFilter.GaussianBlur(radius=1))
-        blr_arr = np.array(blurred)
-        for thresh_val in [110, 140, 170]:
-            binary_img = Image.fromarray(((blr_arr >= thresh_val) * 255).astype('uint8'))
-            candidates.extend(run_ocr(binary_img, f"blur-{thresh_val}"))
-    except:
-        pass
+                cleaned = remove_small_components(binary, min_size=20)
+                clean_img = Image.fromarray(((1 - cleaned) * 255).astype('uint8'))
+                new = run_ocr(clean_img, f"clean-{thresh_val}")
+                candidates.extend(new)
+                if len(candidates) >= 15:
+                    break
 
     print(f"[BOT] OCR candidates ({len(candidates)}): {candidates[:30]}{'...' if len(candidates)>30 else ''}", flush=True)
     if not candidates:
@@ -995,7 +972,7 @@ def run_tab(session, tab_id):
                             session.log(" Acquired captcha-solving slot, starting...")
                             try:
                                 captcha_solved = False
-                                for captcha_attempt in range(20):
+                                for captcha_attempt in range(8):
                                     if session.stop_event.is_set():
                                         return
                                     if not safe_check(page):
@@ -1011,19 +988,19 @@ def run_tab(session, tab_id):
                                             z_sleep(5)
                                             continue
 
-                                        session.log(f" Solving captcha (attempt {captcha_attempt + 1})...")
-                                        z_sleep(2)
+                                        session.log(f" Solving captcha ({captcha_attempt + 1}/8)...")
+                                        z_sleep(1)
                                         captcha_bytes = captcha_img.first.screenshot()
                                         answer = solve_captcha(captcha_bytes)
 
                                         if not answer:
-                                            session.log("  OCR failed, refreshing captcha...")
+                                            session.log("  OCR failed (bad image or unsupported chars), refreshing captcha...")
                                             try: page.locator(".refresh-capthca-btn-new, [onclick*='refresh'], .captcha-refresh").first.click()
                                             except: page.reload(wait_until="domcontentloaded")
                                             z_sleep(3)
                                             continue
 
-                                        session.log(f" Answer: '{answer}'")
+                                        session.log(f" OCR answer: '{answer}'")
                                         remove_overlays(page)
                                         z_sleep(0.5)
 
@@ -1097,6 +1074,7 @@ def run_tab(session, tab_id):
                                         z_sleep(2)
 
                                 if not captcha_solved:
+                                    session.log(" Captcha not solved after max attempts, restarting browser...")
                                     continue
                             finally:
                                 _captcha_semaphore.release()
@@ -1723,7 +1701,7 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
                     await loop.run_in_executor(None, _captcha_semaphore.acquire)
                     try:
                         captcha_solved = False
-                        for ca in range(20):
+                        for ca in range(8):
                             if session.stop_event.is_set():
                                 return
                             if not await safe_check():
@@ -1736,7 +1714,7 @@ async def _run_page_async(session, browser, tab_id, browser_idx):
                                     await page.reload(wait_until="domcontentloaded")
                                     await z_sleep(5)
                                     continue
-                                session.log(f" Solving captcha ({ca+1})...")
+                                session.log(f" Solving captcha ({ca+1}/8)...")
                                 await z_sleep(2)
                                 answer = solve_captcha(await ci.first.screenshot())
                                 if not answer:
