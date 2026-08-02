@@ -28,7 +28,7 @@ _tab_prefix = threading.local()
 CAPTCHA_CONCURRENCY = int(os.environ.get("CAPTCHA_CONCURRENCY", "3"))
 _captcha_semaphore = threading.Semaphore(CAPTCHA_CONCURRENCY)
 _ocr_semaphore = threading.Semaphore(CAPTCHA_CONCURRENCY)
-MAX_GLOBAL_BROWSERS = int(os.environ.get("MAX_GLOBAL_BROWSERS", "20"))
+MAX_GLOBAL_BROWSERS = int(os.environ.get("MAX_GLOBAL_BROWSERS", "8"))
 _browser_semaphore = threading.Semaphore(MAX_GLOBAL_BROWSERS)
 _active_browsers = 0
 _active_browsers_lock = threading.Lock()
@@ -757,9 +757,9 @@ def run_session(session):
     # Use shared browser mode when beneficial (PAGES_PER_BROWSER > 1 and multiple sessions)
     if PAGES_PER_BROWSER > 1 and nt > 1:
         import math as _math
-        num_browsers = max(1, _math.ceil(nt / PAGES_PER_BROWSER))
+        num_browsers = max(1, min(_math.ceil(nt / PAGES_PER_BROWSER), MAX_GLOBAL_BROWSERS))
         actual_sessions = num_browsers * PAGES_PER_BROWSER
-        session.log(f" Launching {num_browsers} browsers x {PAGES_PER_BROWSER} pages = {actual_sessions} sessions ({svc_name})...")
+        session.log(f" Launching {num_browsers} browsers x {PAGES_PER_BROWSER} pages = {actual_sessions} sessions (max {MAX_GLOBAL_BROWSERS} browsers) ({svc_name})...")
         import asyncio
         async def _run_all_browsers():
             tasks = []
@@ -2167,7 +2167,22 @@ async def _run_shared_browser_async(session, browser_idx):
             elif PROXY_URL:
                 launch_opts["proxy"] = {"server": PROXY_URL}
 
-            browser = await p.chromium.launch(slow_mo=100, **launch_opts)
+            # Launch Chromium with retries: transient driver failures (thread/process
+            # pressure, "Connection closed while reading from the driver") are common
+            # under concurrency, so retry with backoff before giving up.
+            launch_err = None
+            for launch_attempt in range(3):
+                try:
+                    browser = await p.chromium.launch(slow_mo=100, **launch_opts)
+                    launch_err = None
+                    break
+                except Exception as le:
+                    launch_err = le
+                    _gc.collect()
+                    session.log(f" [B{browser_idx+1}] Launch attempt {launch_attempt+1}/3 failed: {le} (retrying...)")
+                    await asyncio.sleep(5 * (launch_attempt + 1))
+            if launch_err is not None:
+                raise launch_err
             
             # Each _run_page_async creates its own pages from the shared browser
             tasks = []
@@ -2239,6 +2254,7 @@ def start():
     service = data.get("service", "views").strip().lower()
     username = data.get("username", "").strip()
     tabs = int(data.get("tabs", 1))
+    tabs = max(1, min(tabs, MAX_GLOBAL_BROWSERS * PAGES_PER_BROWSER))
     if not url:
         return jsonify({"error": "No URL provided"}), 400
     if service not in SERVICES:
